@@ -106,3 +106,6 @@ async def test_crewai_memory_async_wrappers(mocker):
     await memory.abuild_context("query")
 
     assert to_thread.call_count == 3
+    assert to_thread.call_args_list[0].args == (memory.save, "task", "output")
+    assert to_thread.call_args_list[1].args == (memory.recall, "query")
+    assert to_thread.call_args_list[2].args == (memory.build_context, "query")

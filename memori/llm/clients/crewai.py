@@ -75,17 +75,18 @@ class CrewAIMemory:
         if trace is not None:
             resolved_trace.update(trace)
         if agent_role is not None:
-            resolved_trace.setdefault("agent_role", agent_role)
+            resolved_trace["agent_role"] = agent_role
         if crew_name is not None:
-            resolved_trace.setdefault("crew_name", crew_name)
+            resolved_trace["crew_name"] = crew_name
 
+        trace_payload = resolved_trace if resolved_trace else None
         self.memori.capture_agent_turn(
             user_content=task,
             assistant_content=output,
             project_id=self.project_id,
             session_id=session_id or self.session_id,
             platform="crewai",
-            trace=resolved_trace or None,
+            trace=trace_payload,
             summary=summary,
             provider=provider,
             model=model,
