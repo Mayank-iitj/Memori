@@ -1,158 +1,229 @@
-"""CrewAI memory integration backed by Memori."""
+r"""
+ __  __                           _
+|  \/  | ___ _ __ ___   ___  _ __(_)
+| |\/| |/ _ \ '_ ` _ \ / _ \| '__| |
+| |  | |  __| | | | | | (_) | |  | |
+|_|  |_|\___|_| |_| |_|\___/|_|  |_|
+                   perfectam memoriam
+                        memorilabs.ai
+"""
 
-from __future__ import annotations
-
-import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
+
+from memori.llm._base import BaseClient
+from memori.llm._constants import CREWAI_FRAMEWORK_PROVIDER
 
 if TYPE_CHECKING:
     from memori import Memori
 
+logger = logging.getLogger(__name__)
 
-class CrewAIMemory:
-    """Persist and recall CrewAI context with Memori.
 
-    This helper captures CrewAI task/output pairs through Memori's agent
-    ingestion endpoint and exposes simple recall/context helpers for later runs.
+class CrewAIMemory(BaseClient):
+    """Memori integration for CrewAI agent framework.
+
+    Enables CrewAI agents to seamlessly use Memori for long-term,
+    structured memory persistence. Captures agent traces, decisions,
+    and contextual information automatically.
+
+    Example:
+        ```python
+        from crewai import Agent, Crew, Task
+        from memori import Memori
+
+        mem = Memori().attribution("team_123", "crewai_crew")
+        agent = Agent(role="Researcher")
+        crew = Crew(agents=[agent], tasks=[...])
+        mem.crewai.register(crew=crew)
+        result = crew.kickoff()
+        # Memories automatically persisted and augmented
+        ```
+
+    Attributes:
+        config: Memori configuration instance.
+        _crewai_clients: Registry of wrapped CrewAI Crew instances.
     """
 
-    def __init__(
-        self,
-        memori: Memori,
-        *,
-        project_id: str,
-        session_id: str | None = None,
-        signal: str = "decision",
-        source: str = "fact",
-    ) -> None:
-        """Create a CrewAI memory bridge.
+    def __init__(self, config: "Memori") -> None:
+        """Initialize CrewAI memory client.
 
         Args:
-            memori: Configured Memori instance.
-            project_id: Memori Cloud project identifier used for agent capture/recall.
-            session_id: Optional fixed session identifier for this memory instance.
-            signal: Optional agent recall signal filter used in cloud recall.
-            source: Optional agent recall source filter used in cloud recall.
+            config: Memori configuration instance.
         """
-        if not isinstance(project_id, str) or not project_id.strip():
-            raise ValueError("project_id must be a non-empty string")
+        super().__init__(config)
+        self._crewai_clients: dict[int, Any] = {}
 
-        self.memori = memori
-        self.project_id = project_id
-        self.session_id = session_id
-        self.signal = signal
-        self.source = source
-
-    def save(
-        self,
-        task: str,
-        output: str,
-        *,
-        agent_role: str | None = None,
-        crew_name: str | None = None,
-        trace: dict[str, Any] | None = None,
-        summary: str | None = None,
-        session_id: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        provider_sdk_version: str | None = None,
-    ) -> None:
-        """Persist a CrewAI execution trace with Memori augmentation.
+    def register(self, crew: Any | None = None) -> "CrewAIMemory":
+        """Register a CrewAI Crew instance for memory integration.
 
         Args:
-            task: Task prompt/input assigned to the agent.
-            output: Agent output/decision for the task.
-            agent_role: Optional CrewAI role for contextual attribution.
-            crew_name: Optional crew/team name for context.
-            trace: Optional additional trace payload merged into base context.
-            summary: Optional session summary metadata.
-            session_id: Optional explicit session identifier override.
-            provider: Optional LLM provider for augmentation metadata.
-            model: Optional LLM model/version for augmentation metadata.
-            provider_sdk_version: Optional provider SDK version metadata.
+            crew: CrewAI Crew instance to wrap with Memori.
+
+        Returns:
+            Self for method chaining.
+
+        Raises:
+            RuntimeError: If crew is None or not a CrewAI Crew.
         """
-        resolved_trace: dict[str, Any] = {}
-        if trace is not None:
-            resolved_trace.update(trace)
-        if agent_role is not None:
-            resolved_trace["agent_role"] = agent_role
-        if crew_name is not None:
-            resolved_trace["crew_name"] = crew_name
+        if crew is None:
+            raise RuntimeError("CrewAI::register called without crew")
 
-        trace_payload = resolved_trace if resolved_trace else None
-        self.memori.capture_agent_turn(
-            user_content=task,
-            assistant_content=output,
-            project_id=self.project_id,
-            session_id=session_id or self.session_id,
-            platform="crewai",
-            trace=trace_payload,
-            summary=summary,
-            provider=provider,
-            model=model,
-            provider_sdk_version=provider_sdk_version,
-        )
-
-    async def asave(self, *args: Any, **kwargs: Any) -> None:
-        """Async wrapper for :meth:`save`."""
-        await asyncio.to_thread(self.save, *args, **kwargs)
-
-    def recall(
-        self,
-        query: str,
-        *,
-        limit: int | None = None,
-        session_id: str | None = None,
-    ) -> Any:
-        """Recall memories for a CrewAI query.
-
-        Cloud mode uses the agent recall endpoint scoped by project/session.
-        BYODB mode uses ``memori.recall(query, limit=...)``.
-        """
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError("query must be a non-empty string")
-
-        if self.memori.config.cloud:
-            return self.memori.agent_recall(
-                query=query,
-                project_id=self.project_id,
-                session_id=session_id or self.session_id,
-                signal=self.signal,
-                source=self.source,
+        if not self._is_crewai_crew(crew):
+            raise RuntimeError(
+                "crew provided is not instance of crewai.crew.Crew"
             )
-        return self.memori.recall(query, limit=limit)
 
-    async def arecall(self, *args: Any, **kwargs: Any) -> Any:
-        """Async wrapper for :meth:`recall`."""
-        return await asyncio.to_thread(self.recall, *args, **kwargs)
+        if not hasattr(crew, "_memori_installed"):
+            self._wrap_crew_execute(crew)
+            crew._memori_installed = True
 
-    def build_context(self, query: str, *, limit: int | None = None) -> str:
-        """Build a newline-delimited memory context string for CrewAI prompts."""
-        payload = self.recall(query, limit=limit)
-        contents = self._extract_contents(payload)
-        return "\n".join(f"- {content}" for content in contents)
+        self._crewai_clients[id(crew)] = crew
+        return self
 
-    async def abuild_context(self, query: str, *, limit: int | None = None) -> str:
-        """Async wrapper for :meth:`build_context`."""
-        return await asyncio.to_thread(self.build_context, query, limit=limit)
+    def _wrap_crew_execute(self, crew: Any) -> None:
+        """Wrap CrewAI Crew.kickoff to intercept and capture traces.
+
+        Args:
+            crew: CrewAI Crew instance to wrap.
+        """
+        original_kickoff = crew.kickoff
+
+        def wrapped_kickoff(*args: Any, **kwargs: Any) -> Any:
+            """Wrapped kickoff that captures agent execution traces."""
+            result = original_kickoff(*args, **kwargs)
+            self._capture_crew_execution(crew, result, kwargs)
+            return result
+
+        crew.kickoff = wrapped_kickoff
+
+        # Wrap async kickoff if available
+        if hasattr(crew, "kickoff_async"):
+            original_kickoff_async = crew.kickoff_async
+
+            async def wrapped_kickoff_async(
+                *args: Any, **kwargs: Any
+            ) -> Any:
+                """Wrapped async kickoff for coroutine execution."""
+                result = await original_kickoff_async(*args, **kwargs)
+                self._capture_crew_execution(crew, result, kwargs)
+                return result
+
+            crew.kickoff_async = wrapped_kickoff_async
+
+    def _capture_crew_execution(
+        self, crew: Any, result: Any, context: dict[str, Any]
+    ) -> None:
+        """Capture and augment crew execution as structured memory.
+
+        Args:
+            crew: CrewAI Crew instance.
+            result: Execution result from kickoff.
+            context: Execution context (inputs, etc).
+        """
+        try:
+            # Extract metadata from crew
+            agents_info = self._extract_agents_info(crew)
+            tasks_info = self._extract_tasks_info(crew)
+
+            # Build memory object
+            memory_data = {
+                "type": "crew_execution",
+                "crew_id": id(crew),
+                "agents": agents_info,
+                "tasks": tasks_info,
+                "inputs": context.get("inputs", {}),
+                "output": str(result)[:1000],
+                "output_type": (
+                    result.__class__.__name__ if result is not None else None
+                ),
+            }
+
+            # Store via Memori augmentation
+            if hasattr(self.config, "augmentation"):
+                augmentation = getattr(self.config, "augmentation", None)
+                if augmentation is not None and hasattr(
+                    augmentation, "store"
+                ):
+                    augmentation.store(
+                        memory_data,
+                        provider=CREWAI_FRAMEWORK_PROVIDER,
+                    )
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to capture CrewAI execution: {str(e)}"
+            )
 
     @staticmethod
-    def _extract_contents(payload: Any) -> list[str]:
-        if isinstance(payload, dict):
-            facts = payload.get("facts", [])
-            if isinstance(facts, list):
-                return [
-                    str(item["content"])
-                    for item in facts
-                    if isinstance(item, dict) and "content" in item
-                ]
-            return []
+    def _extract_agents_info(crew: Any) -> list[dict[str, str]]:
+        """Extract agent roles and descriptions.
 
-        if isinstance(payload, list):
-            extracted: list[str] = []
-            for item in payload:
-                if isinstance(item, dict) and "content" in item:
-                    extracted.append(str(item["content"]))
-            return extracted
+        Args:
+            crew: CrewAI Crew instance.
 
-        return []
+        Returns:
+            List of agent metadata dicts.
+        """
+        agents_info = []
+        try:
+            for agent in crew.agents:
+                agents_info.append(
+                    {
+                        "role": getattr(agent, "role", "unknown"),
+                        "goal": getattr(agent, "goal", ""),
+                        "backstory": getattr(agent, "backstory", "")[
+                            :200
+                        ],
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Failed to extract agents info: {e}")
+        return agents_info
+
+    @staticmethod
+    def _extract_tasks_info(crew: Any) -> list[dict[str, str]]:
+        """Extract task descriptions and assignments.
+
+        Args:
+            crew: CrewAI Crew instance.
+
+        Returns:
+            List of task metadata dicts.
+        """
+        tasks_info = []
+        try:
+            for task in crew.tasks:
+                tasks_info.append(
+                    {
+                        "description": getattr(task, "description", "")[
+                            :500
+                        ],
+                        "assigned_to": (
+                            getattr(task.agent, "role", "unknown")
+                            if hasattr(task, "agent")
+                            else "unassigned"
+                        ),
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Failed to extract tasks info: {e}")
+        return tasks_info
+
+    @staticmethod
+    def _is_crewai_crew(crew: Any) -> bool:
+        """Validate if object is a CrewAI Crew instance.
+
+        Args:
+            crew: Object to validate.
+
+        Returns:
+            True if crew is a CrewAI Crew instance.
+        """
+        try:
+            return (
+                "crewai" in str(type(crew).__module__)
+                and "Crew" in type(crew).__name__
+            )
+        except Exception:
+            return False
